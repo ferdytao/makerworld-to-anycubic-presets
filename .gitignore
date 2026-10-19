@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+imported_presets/
+overwritten_presets_backup/
