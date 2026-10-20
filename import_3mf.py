@@ -5,6 +5,13 @@ Usage:
   python -I import_3mf.py file.3mf --install     # also copies the preset into the slicer (slicer must be closed)
   python -I import_3mf.py file.3mf --install --force   # overwrite a preset with the same name (a backup is kept)
 
+Choosing the starting (reference) preset:
+  python -I import_3mf.py --list-refs                  # show the Kobra X presets you can start from
+  python -I import_3mf.py file.3mf --quality high      # same layer height, 'High Quality' variant (slower, nicer)
+  python -I import_3mf.py file.3mf --layer 0.16        # finer layer height (shell layer counts are scaled)
+  python -I import_3mf.py file.3mf -r "Your preset"    # any system or user preset, by exact name
+  python -I import_3mf.py file.3mf --project           # also write a copy of the 3mf re-centred on your bed
+
 Safety rules (the machine comes before the maker):
   * only a WHITELIST of quality/structure options is imported (walls, infill, supports, brim, ironing...);
     G-code, retraction, z-hop, temperatures, bed/plate, fans, prime tower, etc. are NEVER imported;
@@ -234,6 +241,71 @@ def fit_warnings(z, lim):
     return w, h
 
 
+def list_refs(S):
+    """Print the process presets usable as a reference (-r) for the target machine."""
+    dirs = [S["user"], *S["system"]]
+    rows = []
+    for d in dirs:
+        kind = "user" if d == S["user"] else "system"
+        for p in sorted(glob.glob(os.path.join(d, "*.json"))):
+            n = os.path.splitext(os.path.basename(p))[0]
+            if kind == "system" and not n.endswith("@" + MACHINE):
+                continue
+            r = load_ref(n, dirs)
+            if r and num(r.get("layer_height")) is not None:
+                g = lambda k: str(norm(r.get(k, "-")))
+                rows.append((kind, n, g("layer_height"), g("outer_wall_speed"), g("default_acceleration"),
+                             g("sparse_infill_pattern"), f"{g('top_shell_layers')}/{g('bottom_shell_layers')}"))
+    rows.sort(key=lambda x: (x[0] != "system", float(x[2]), x[1]))
+    print(f"{'kind':7s}{'layer':>6s}{'outer':>7s}{'accel':>7s}  {'infill':12s}{'top/bot':>8s}  name")
+    for kind, n, lh, ow, ac, pat, sh in rows:
+        print(f"{kind:7s}{lh:>6s}{ow:>7s}{ac:>7s}  {pat:12s}{sh:>8s}  {n}")
+    print('\nUse the name with -r "...", or --quality high / --layer 0.16 to let the script pick a system preset.')
+
+
+def bed_size(ps):
+    """Bed width/height (mm) of the maker's printer, from printable_area (default: Bambu 256x256)."""
+    try:
+        pts = [tuple(float(c) for c in str(a).split("x")) for a in ps["printable_area"]]
+        return max(x for x, _ in pts) - min(x for x, _ in pts), max(y for _, y in pts) - min(y for _, y in pts)
+    except (KeyError, ValueError, TypeError):
+        return 256.0, 256.0
+
+
+def recenter_project(src, dst, sw, sh, dw, dh):
+    """Copy the 3mf to dst moving every plate item from the maker's bed (sw x sh) to the centre of yours (dw x dh).
+    Only the placement transforms are touched: meshes and settings stay exactly as they are.
+    Plates are laid out side by side with a 20% gap (Bambu / Orca convention)."""
+    psx, psy, pdx, pdy = sw * 1.2, sh * 1.2, dw * 1.2, dh * 1.2
+    ox, oy = (dw - sw) / 2, (dh - sh) / 2
+    moved = [0]
+
+    def newxy(x, y):
+        c, r = math.floor(x / psx), math.floor(y / psy)
+        return c * pdx + (x - c * psx) + ox, r * pdy + (y - r * psy) + oy
+
+    def fix(m):
+        v = m.group(2).split()
+        if len(v) != 12:
+            return m.group(0)
+        try:
+            x, y = float(v[9]), float(v[10])
+        except ValueError:
+            return m.group(0)
+        v[9], v[10] = (fmt(c) for c in newxy(x, y))
+        moved[0] += 1
+        return m.group(1) + " ".join(v) + m.group(3)
+    # only the build items (plate placement): the "assemble" view in model_settings.config is unrelated to the plate
+    pat = {"3D/3dmodel.model": re.compile(r'(<item\b[^>]*?\btransform=")([^"]+)(")')}
+    with zipfile.ZipFile(src) as zi, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zo:
+        for it in zi.infolist():
+            data = zi.read(it.filename)
+            if it.filename in pat and len(data) < MAX_BYTES:
+                data = pat[it.filename].sub(fix, data.decode("utf-8")).encode("utf-8")
+            zo.writestr(it, data)
+    return moved[0]
+
+
 def slicer_running(word):
     out = subprocess.run(["tasklist"], capture_output=True, text=True).stdout.lower()
     return word in out
@@ -241,15 +313,30 @@ def slicer_running(word):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("file")
+    ap.add_argument("file", nargs="?")
     ap.add_argument("-r", "--ref", default=None,
-                    help="reference Kobra X process preset (default: '<maker layer height>mm Standard')")
+                    help="reference process preset, exact name, system or user "
+                         "(default: '<maker layer height>mm Standard', see --quality / --layer)")
+    ap.add_argument("--quality", choices=("auto", "standard", "high"), default="auto",
+                    help="auto: 'High Quality' only if the maker's process says so; high: use the High Quality "
+                         "variant of the layer height when it exists; standard: always Standard")
+    ap.add_argument("--layer", type=float, help="start from another layer height (mm), e.g. 0.16; "
+                                                "shell layer counts are scaled to keep the same thickness")
+    ap.add_argument("--list-refs", action="store_true", help="list the presets you can start from and exit")
+    ap.add_argument("--project", action="store_true",
+                    help="also write a copy of the 3mf re-centred on your bed (settings untouched)")
     ap.add_argument("-s", "--slicer", choices=sorted(SLICERS), default="anycubic",
                     help="target slicer: system presets and user folder (default: anycubic)")
     ap.add_argument("-n", "--name", help="preset name (default: file name)")
     ap.add_argument("--install", action="store_true", help="copy the preset into the slicer (it must be closed)")
     ap.add_argument("--force", action="store_true", help="overwrite a preset that is already installed (backup kept)")
     a = ap.parse_args()
+    S = SLICERS[a.slicer]
+    if a.list_refs:
+        list_refs(S)
+        return
+    if not a.file:
+        ap.error("the following arguments are required: file")
 
     try:
         z = zipfile.ZipFile(a.file)
@@ -262,23 +349,40 @@ def main():
         sys.exit("No project_settings.config: nothing to import (geometry only).")
     except (zipfile.BadZipFile, ValueError, OSError) as e:
         sys.exit(f"Invalid file ({a.file}): {e or 'unrecognised format'}")
-    S = SLICERS[a.slicer]
     dirs = [S["user"], *S["system"]]
     auto_ref = a.ref is None
+    ref_note = ""
+    if not auto_ref and (a.layer or a.quality != "auto"):
+        print("NOTE: -r was given, so --layer / --quality are ignored.")
     if auto_ref:  # the maker's system-preset layer height is NOT in the overrides: the reference carries it
         a.ref = DEFAULT_REF
         try:
-            lh = float(norm(ps["layer_height"]))
-            # maker "Fine / High Quality / Optimal" -> Anycubic High Quality variant (slower), then Standard
-            var = (["High Quality"] if re.search(r"Fine|High Quality|Optimal", str(ps.get("print_settings_id", "")))
-                   else []) + ["Standard"]
+            lh = a.layer or float(norm(ps["layer_height"]))
+            hq_maker = bool(re.search(r"Fine|High Quality|Optimal", str(ps.get("print_settings_id", ""))))
+            want_hq = a.quality == "high" or (a.quality == "auto" and hq_maker)
+            var = (["High Quality"] if want_hq else []) + ["Standard"]
             a.ref = next((c for c in (f"{lh:.2f}mm {v} @{MACHINE}" for v in var) if load_ref(c, dirs)), DEFAULT_REF)
+            if a.quality == "high" and "High Quality" not in a.ref:
+                ref_note = f" (no High Quality preset at {lh:.2f} mm, Standard used)"
+            elif a.layer:
+                ref_note = f" (layer height chosen with --layer {a.layer})"
+            elif a.quality == "high":
+                ref_note = " (High Quality variant requested)"
+            else:
+                ref_note = " (chosen from the maker's layer height)"
         except (KeyError, ValueError, TypeError):
             pass
     ref = load_ref(a.ref, dirs)
     if not ref:
-        sys.exit(f"Reference preset '{a.ref}' not found ({a.slicer}).")
+        sys.exit(f"Reference preset '{a.ref}' not found ({a.slicer}). Use --list-refs to see the available ones.")
     lim = machine_limits(S["machine"])
+    try:
+        maker_lh = float(norm(ps["layer_height"]))
+    except (KeyError, ValueError, TypeError):
+        maker_lh = None
+    ref_lh = num(ref.get("layer_height"))
+    # shell layer counts are tuned for the maker's layer height: keep the same thickness on another one
+    scale = maker_lh / ref_lh if maker_lh and ref_lh and abs(maker_lh - ref_lh) > 1e-6 else 1.0
 
     diff = ps.get("different_settings_to_system", [])
     keys = [k for k in (diff[0].split(";") if isinstance(diff, list) and diff and isinstance(diff[0], str) else [])
@@ -303,6 +407,9 @@ def main():
         v = ps.get(k)
         if k in VALUE_ALIAS and norm(v) in VALUE_ALIAS[k]:
             v = VALUE_ALIAS[k][norm(v)]
+        if scale != 1.0 and k in ("top_shell_layers", "bottom_shell_layers") and num(v) is not None:
+            v = str(max(1, round(num(v) * scale)))
+            extra[k] = f"scaled x{scale:.2f}: maker {maker_lh} mm -> {ref_lh} mm layers"
         st, val, why = classify(t, v, ref, lim)
         why = "; ".join(x for x in (why, extra.get(k, ""), f"key renamed to {t}" if t != k else "") if x)
         rows.append((k, norm(ps.get(k)), st, val, why))
@@ -328,12 +435,21 @@ def main():
     json.dump(out, open(jp, "w", encoding="utf-8", newline="\n"), indent=4, ensure_ascii=False, sort_keys=True)
     open(os.path.join(OUT, name + ".info"), "w", encoding="utf-8", newline="\n").write(info)
 
+    proj_line = []
+    if a.project:
+        sw, sh = bed_size(ps)
+        pj = os.path.join(OUT, name + ".3mf")
+        n_moved = recenter_project(a.file, pj, sw, sh, lim["bed_x"], lim["bed_y"])
+        proj_line = [f"- Re-centred copy of the project: `{os.path.basename(pj)}` "
+                     f"(maker's bed {sw:.0f}x{sh:.0f} -> {lim['bed_x']:.0f}x{lim['bed_y']:.0f}, {n_moved} placements moved; "
+                     f"meshes and settings untouched, the slicer will still ask to switch printer on open)"]
+
     # report
     L = [f"# Import {os.path.basename(a.file)}", "",
          f"- Maker's printer: {ps.get('printer_settings_id')}",
          f"- Maker's process: {ps.get('print_settings_id')}",
-         f"- Kobra X reference: `{a.ref}`" + (" (chosen from the maker's layer height)" if auto_ref else ""),
-         f"- Target slicer: {a.slicer}", f"- Generated preset: `{name}`", "",
+         f"- Kobra X reference: `{a.ref}`" + (ref_note if auto_ref else " (chosen with -r)"),
+         f"- Target slicer: {a.slicer}", f"- Generated preset: `{name}`", *proj_line, "",
          f"Machine limits: speed {lim['speed']:.0f} mm/s, accel {lim['accel']:.0f} mm/s², jerk {lim['jerk']:.0f}, "
          f"layer {lim['lh_min']}-{lim['lh_max']} mm, bed {lim['bed_x']:.0f}x{lim['bed_y']:.0f}x{lim['bed_z']:.0f} mm.", ""]
     if warn:
@@ -355,7 +471,8 @@ def main():
     open(rp, "w", encoding="utf-8", newline="\n").write("\n".join(L) + "\n")
 
     n = {s: sum(1 for r in rows if r[2] == s) for s in ("applied", "limited", "same", "discarded")}
-    print(f"Preset: {jp}\nReport: {rp}")
+    print(f"Preset: {jp}\nReport: {rp}" + (f"\nProject: {pj}" if a.project else ""))
+    print(f"Reference: {a.ref}")
     print(f"Maker options {len(rows)}: applied {n['applied']}, limited {n['limited']}, "
           f"already the same {n['same']}, discarded {n['discarded']}")
     for x in warn:
