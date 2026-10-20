@@ -241,6 +241,17 @@ def fit_warnings(z, lim):
     return w, h
 
 
+def nearest_standard(lh, dirs):
+    """Layer height (mm) of the Standard preset for MACHINE closest to lh (ties: the finer one). None if none found."""
+    heights = set()
+    for d in dirs:
+        for p in glob.glob(os.path.join(d, f"*mm Standard @{MACHINE}.json")):
+            m = re.match(r"(\d+\.\d+)mm Standard @", os.path.basename(p))
+            if m:
+                heights.add(float(m.group(1)))
+    return min(heights, key=lambda c: (abs(c - lh), c)) if heights else None
+
+
 def list_refs(S):
     """Print the process presets usable as a reference (-r) for the target machine."""
     dirs = [S["user"], *S["system"]]
@@ -354,22 +365,33 @@ def main():
     ref_note = ""
     if not auto_ref and (a.layer or a.quality != "auto"):
         print("NOTE: -r was given, so --layer / --quality are ignored.")
+    layer_override = False  # True when no preset exists at the maker's layer height: the height is kept as an override
     if auto_ref:  # the maker's system-preset layer height is NOT in the overrides: the reference carries it
         a.ref = DEFAULT_REF
+        ref_note = " (default: the maker's layer height could not be read)"
         try:
             lh = a.layer or float(norm(ps["layer_height"]))
             hq_maker = bool(re.search(r"Fine|High Quality|Optimal", str(ps.get("print_settings_id", ""))))
             want_hq = a.quality == "high" or (a.quality == "auto" and hq_maker)
             var = (["High Quality"] if want_hq else []) + ["Standard"]
-            a.ref = next((c for c in (f"{lh:.2f}mm {v} @{MACHINE}" for v in var) if load_ref(c, dirs)), DEFAULT_REF)
-            if a.quality == "high" and "High Quality" not in a.ref:
-                ref_note = f" (no High Quality preset at {lh:.2f} mm, Standard used)"
-            elif a.layer:
-                ref_note = f" (layer height chosen with --layer {a.layer})"
-            elif a.quality == "high":
-                ref_note = " (High Quality variant requested)"
-            else:
-                ref_note = " (chosen from the maker's layer height)"
+            found = next((c for c in (f"{lh:.2f}mm {v} @{MACHINE}" for v in var) if load_ref(c, dirs)), None)
+            if found:
+                a.ref = found
+                if a.quality == "high" and "High Quality" not in a.ref:
+                    ref_note = f" (no High Quality preset at {lh:.2f} mm, Standard used)"
+                elif a.layer:
+                    ref_note = f" (layer height chosen with --layer {a.layer})"
+                elif a.quality == "high":
+                    ref_note = " (High Quality variant requested)"
+                else:
+                    ref_note = " (chosen from the maker's layer height)"
+            else:  # no preset at this height (e.g. 0.15 or 0.10): nearest Standard, keep the real height as an override
+                near = nearest_standard(lh, dirs)
+                if near is not None:
+                    a.ref = f"{near:.2f}mm Standard @{MACHINE}"
+                    layer_override = not a.layer
+                    ref_note = (f" (no preset at {lh:.2f} mm: nearest is {near:.2f} mm Standard"
+                                + ("; the maker's layer height is kept" if layer_override else "") + ")")
         except (KeyError, ValueError, TypeError):
             pass
     ref = load_ref(a.ref, dirs)
@@ -382,12 +404,16 @@ def main():
         maker_lh = None
     ref_lh = num(ref.get("layer_height"))
     # shell layer counts are tuned for the maker's layer height: keep the same thickness on another one
-    scale = maker_lh / ref_lh if maker_lh and ref_lh and abs(maker_lh - ref_lh) > 1e-6 else 1.0
+    scale = (maker_lh / ref_lh if maker_lh and ref_lh and abs(maker_lh - ref_lh) > 1e-6 and not layer_override
+             else 1.0)  # with the layer height kept as an override the shell counts already fit it
 
     diff = ps.get("different_settings_to_system", [])
     keys = [k for k in (diff[0].split(";") if isinstance(diff, list) and diff and isinstance(diff[0], str) else [])
             if k]
     extra = {}  # key -> note: options imported even if equal to the Bambu default
+    if layer_override and "layer_height" not in keys:
+        keys.append("layer_height")
+        extra["layer_height"] = "no preset at this height: maker's value kept on the nearest preset"
     if str(norm(ps.get("ironing_type", "no ironing"))) != "no ironing":
         for k in IRONING_FAMILY:  # default Bambu ironing parameters do not appear among the overrides
             if k not in keys and k in ps:

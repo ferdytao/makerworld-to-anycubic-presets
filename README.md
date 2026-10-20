@@ -58,6 +58,18 @@ Installed presets land in `%APPDATA%\AnycubicSlicerNext\user\<id>\process\`. Res
 
 The maker's file only stores what they *changed*, so everything else comes from the **reference preset** the new preset inherits from. By default the script picks `<maker's layer height> Standard @Anycubic Kobra X 0.4 nozzle` (or the High Quality variant if the maker's process name says Fine / High Quality / Optimal). That is the safe, fast choice, and it keeps the layer height the model was designed for.
 
+**The maker's layer height decides the default.** The script reads the layer height saved in the project, and the name of the maker's process preset:
+
+| Maker's process | Starting preset on the Kobra X |
+|---|---|
+| 0.20 Standard, 0.24 Draft, 0.28 Extra Draft | `0.20` / `0.24` / `0.28` Standard |
+| 0.16 Optimal | `0.16 High Quality` (Bambu's "Optimal" and "Fine" are matched to Anycubic's High Quality) |
+| 0.12 Fine | `0.12 High Quality` |
+| 0.08 Extra Fine | `0.08 Standard` (there is no 0.08 High Quality) |
+| A custom height with no Anycubic preset (0.15, 0.18, 0.10…) | the **nearest Standard**, plus the maker's exact `layer_height` kept as an override; the report says so |
+
+So a maker working at 0.12 or 0.16 gets a 0.12 / 0.16 starting point, not 0.20. Older versions fell back silently to 0.20 Standard when the exact height did not exist. If the maker renamed their process (for example "My preset – Copy"), the High Quality match is lost and Standard is used: nothing is imported from such a custom copy anyway, the report warns about it.
+
 If you want a nicer result for one specific project, start from a better preset:
 
 ```bat
