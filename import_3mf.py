@@ -486,7 +486,7 @@ def main():
               "Check by hand or use `extract_overrides.py`.", ""]
     L += [f"## Maker's options ({len(rows)})", "", "| Option | Maker | Applied | Result | Note |", "|---|---|---|---|---|"]
     for k, v, st, val, why in rows:
-        L.append(f"| `{k}` | {v} | {val if val is not None else '—'} | {st} | {why} |")
+        L.append(f"| `{k}` | {v} | {val if val is not None else '-'} | {st} | {why} |")
     if not rows:
         L.append("| _no process overrides_ | | | | |")
     L += ["", "## Not imported (on purpose)", "- The maker's filament and printer: use your own profiles.",
